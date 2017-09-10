@@ -19,6 +19,8 @@ import time
 import urllib.request
 import uuid
 
+ZFS_DATASET = "mkosi_build"
+
 try:
     import argcomplete
 except ImportError:
@@ -49,6 +51,7 @@ class OutputFormat(Enum):
     directory = 4
     subvolume = 5
     tar = 6
+    dataset = 7
 
 class Distribution(Enum):
     fedora = 1
@@ -103,6 +106,13 @@ def unshare(flags):
         e = ctypes.get_errno()
         raise OSError(e, os.strerror(e))
 
+def setns(fd, nstype):
+    libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+
+    if libc.setns(ctypes.c_int(fd), ctypes.c_int(nstype)) != 0:
+        e = ctypes.get_errno()
+        raise OSError(e, os.strerror(e))
+
 def format_bytes(bytes):
     if bytes >= 1024*1024*1024:
         return "{:0.1f}G".format(bytes / 1024**3)
@@ -134,9 +144,26 @@ def init_namespace(args):
     unshare(CLONE_NEWNS)
     subprocess.run(["mount", "--make-rslave", "/"], check=True)
 
+@complete_step('Reattaching namespace')
+def reattach_namespace():
+    with open(os.path.join("/", "proc", str(os.getppid()), "ns", "mnt")) as file_:
+        fd = file_.fileno()
+        setns(fd, CLONE_NEWNS)
+
+@complete_step('Mount ZFS datsets')
+def mount_zfs_datasets(args):
+    root = os.path.basename(args.output)
+    zfs_dataset_mount(os.path.join(args.output_pool, ZFS_DATASET, root))
+    zfs_dataset_mount(os.path.join(args.output_pool, ZFS_DATASET, root, "home"))
+    zfs_dataset_mount(os.path.join(args.output_pool, ZFS_DATASET, root, "srv"))
+    zfs_dataset_mount(os.path.join(args.output_pool, ZFS_DATASET, root, "var"))
+    zfs_dataset_mount(os.path.join(args.output_pool, ZFS_DATASET, root, "var/tmp"))
+    zfs_dataset_mount(os.path.join(args.output_pool, ZFS_DATASET, root, "var/lib/machines"))
+
+
 def setup_workspace(args):
     print_step("Setting up temporary workspace.")
-    if args.output_format in (OutputFormat.directory, OutputFormat.subvolume):
+    if args.output_format in (OutputFormat.directory, OutputFormat.subvolume, OutputFormat.dataset):
         d = tempfile.TemporaryDirectory(dir=os.path.dirname(args.output), prefix='.mkosi-')
     else:
         d = tempfile.TemporaryDirectory(dir='/var/tmp', prefix='mkosi-')
@@ -154,6 +181,32 @@ def btrfs_subvol_delete(path):
 
 def btrfs_subvol_make_ro(path, b=True):
     subprocess.run(["btrfs", "property", "set", path, "ro", "true" if b else "false"], check=True)
+
+def zfs_dataset_create(filesystem, mountpoint=None, canmount=None, mode=0o755):
+    m = os.umask(~mode & 0o7777)
+    cmd = ["zfs", "create"]
+    if mountpoint:
+        cmd += ["-o", "mountpoint={}".format(mountpoint)]
+    if canmount:
+        cmd += ["-o", "canmount={}".format(canmount)]
+    cmd.append(filesystem)
+    subprocess.run(cmd, check=True)
+    os.umask(m)
+
+def zfs_dataset_delete(filesystem):
+    subprocess.run(["zfs", "destroy", "-r", filesystem], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+
+def zfs_dataset_make_ro(filesystem, b=True):
+    subprocess.run(["zfs", "set", "readonly={}".format("on" if b else "off"), filesystem], check=True)
+
+def zfs_dataset_mount(filesystem):
+    subprocess.run(["zfs", "mount", filesystem], check=True)
+
+def zfs_dataset_move(filesystem, newmountpoint):
+    subprocess.run(["zfs", "set", "mountpoint={}".format(newmountpoint), filesystem], check=True)
+
+def zfs_dataset_rename(oldfilesystem, newfilesystem):
+    subprocess.run(["zfs", "rename", oldfilesystem, newfilesystem], check=True)
 
 def image_size(args):
     size = GPT_HEADER_SIZE + GPT_FOOTER_SIZE
@@ -455,7 +508,7 @@ def luks_setup_srv(args, loopdev, run_build_script):
 @contextlib.contextmanager
 def luks_setup_all(args, loopdev, run_build_script):
 
-    if args.output_format in (OutputFormat.directory, OutputFormat.subvolume, OutputFormat.tar):
+    if args.output_format in (OutputFormat.directory, OutputFormat.subvolume, OutputFormat.tar, OutputFormat.dataset):
         yield (None, None, None)
         return
 
@@ -626,6 +679,9 @@ def prepare_tree(args, workspace, run_build_script, cached):
 
     if args.output_format == OutputFormat.subvolume:
         btrfs_subvol_create(os.path.join(workspace, "root"))
+    elif args.output_format == OutputFormat.dataset:
+        zfs_dataset_create(os.path.join(args.output_pool, ZFS_DATASET), workspace, canmount="off")
+        zfs_dataset_create(os.path.join(args.output_pool, ZFS_DATASET, "root"), canmount="on")
     else:
         try:
             os.mkdir(os.path.join(workspace, "root"))
@@ -643,6 +699,14 @@ def prepare_tree(args, workspace, run_build_script, cached):
         btrfs_subvol_create(os.path.join(workspace, "root", "var/tmp"), 0o1777)
         os.mkdir(os.path.join(workspace, "root", "var/lib"))
         btrfs_subvol_create(os.path.join(workspace, "root", "var/lib/machines"), 0o700)
+    elif args.output_format == OutputFormat.dataset:
+        zfs_dataset_create(os.path.join(args.output_pool, ZFS_DATASET, "root", "home"))
+        zfs_dataset_create(os.path.join(args.output_pool, ZFS_DATASET, "root", "srv"))
+        zfs_dataset_create(os.path.join(args.output_pool, ZFS_DATASET, "root", "var"))
+        zfs_dataset_create(os.path.join(args.output_pool, ZFS_DATASET, "root", "var/tmp"), mode=0o1777)
+        zfs_dataset_create(os.path.join(args.output_pool, ZFS_DATASET, "root", "var/lib"), canmount="off")
+        os.mkdir(os.path.join(workspace, "root", "var/lib"))
+        zfs_dataset_create(os.path.join(args.output_pool, ZFS_DATASET, "root", "var/lib/machines"), mode=0o700)
 
     if cached:
         return
@@ -1121,6 +1185,9 @@ def install_opensuse(args, workspace, run_build_script):
     if args.output_format in (OutputFormat.subvolume, OutputFormat.raw_btrfs):
         extra_packages += ["btrfsprogs"]
 
+    if args.output_format == OutputFormat.dataset:
+        extra_packages += ["zfsutils-linux"]
+
     if args.packages:
         extra_packages += args.packages
 
@@ -1381,11 +1448,15 @@ def make_read_only(args, workspace, for_cache):
     if for_cache:
         return
 
-    if args.output_format not in (OutputFormat.raw_btrfs, OutputFormat.subvolume):
+    if args.output_format not in (OutputFormat.raw_btrfs, OutputFormat.subvolume, OutputFormat.dataset):
         return
 
-    with complete_step('Marking root subvolume read-only'):
-        btrfs_subvol_make_ro(os.path.join(workspace, "root"))
+    if args.output_format == OutputFormat.dataset:
+        with complete_step('Marking root dataset read-only'):
+            zfs_dataset_make_ro(os.path.join(args.output_pool, ZFS_DATASET, "root"))
+    else:
+        with complete_step('Marking root subvolume read-only'):
+            btrfs_subvol_make_ro(os.path.join(workspace, "root"))
 
 def make_tar(args, workspace, run_build_script, for_cache):
 
@@ -1697,7 +1768,7 @@ def hash_file(of, sf, fname):
     of.write(h.hexdigest() + " *" + fname + "\n")
 
 def calculate_sha256sum(args, raw, tar, root_hash_file, nspawn_settings):
-    if args.output_format in (OutputFormat.directory, OutputFormat.subvolume):
+    if args.output_format in (OutputFormat.directory, OutputFormat.subvolume, OutputFormat.dataset):
         return None
 
     if not args.checksum:
@@ -1758,6 +1829,9 @@ def link_output(args, workspace, raw, tar):
                        'Successfully linked ' + args.output):
         if args.output_format in (OutputFormat.directory, OutputFormat.subvolume):
             os.rename(os.path.join(workspace, "root"), args.output)
+        elif args.output_format == OutputFormat.dataset:
+            zfs_dataset_move(os.path.join(args.output_pool, ZFS_DATASET), os.path.dirname(args.output))
+            zfs_dataset_rename(os.path.join(args.output_pool, ZFS_DATASET, "root"), os.path.join(args.output_pool, ZFS_DATASET, os.path.basename(args.output)))
         elif args.output_format in (OutputFormat.raw_btrfs, OutputFormat.raw_gpt, OutputFormat.raw_squashfs):
             os.chmod(raw, 0o666 & ~args.original_umask)
             os.link(raw, args.output)
@@ -1816,7 +1890,7 @@ def dir_size(path):
     return sum
 
 def print_output_size(args):
-    if args.output_format in (OutputFormat.directory, OutputFormat.subvolume):
+    if args.output_format in (OutputFormat.directory, OutputFormat.subvolume, OutputFormat.dataset):
         print_step("Resulting image size is " + format_bytes(dir_size(args.output)) + ".")
     else:
         st = os.stat(args.output)
@@ -1860,13 +1934,14 @@ def parse_args():
     group = parser.add_argument_group("Output")
     group.add_argument('-t', "--format", dest='output_format', choices=OutputFormat.__members__, help='Output Format')
     group.add_argument('-o', "--output", help='Output image path', metavar='PATH')
+    group.add_argument("--output-pool", help='ZFS output pool')
     group.add_argument('-f', "--force", action='count', dest='force_count', default=0, help='Remove existing image file before operation')
     group.add_argument('-b', "--bootable", type=parse_boolean, nargs='?', const=True,
                        help='Make image bootable on EFI (only raw_gpt, raw_btrfs, raw_squashfs)')
     group.add_argument("--secure-boot", action='store_true', help='Sign the resulting kernel/initrd image for UEFI SecureBoot')
     group.add_argument("--secure-boot-key", help="UEFI SecureBoot private key in PEM format", metavar='PATH')
     group.add_argument("--secure-boot-certificate", help="UEFI SecureBoot certificate in X509 format", metavar='PATH')
-    group.add_argument("--read-only", action='store_true', help='Make root volume read-only (only raw_gpt, raw_btrfs, subvolume, implied on raw_squashs)')
+    group.add_argument("--read-only", action='store_true', help='Make root volume read-only (only raw_gpt, raw_btrfs, subvolume, dataset, implied on raw_squashs)')
     group.add_argument("--encrypt", choices=("all", "data"), help='Encrypt everything except: ESP ("all") or ESP and root ("data")')
     group.add_argument("--verity", action='store_true', help='Add integrity partition (implies --read-only)')
     group.add_argument("--compress", action='store_true', help='Enable compression in file system (only raw_btrfs, subvolume)')
@@ -1980,6 +2055,12 @@ def unlink_try_hard(path):
         pass
 
     try:
+        ret = subprocess.run(["zfs", "get", "-H", "-o", "name", "mountpoint", path], stdout=subprocess.PIPE, check=True)
+        zfs_dataset_delete(ret.stdout.strip())
+    except:
+        pass
+
+    try:
         shutil.rmtree(path)
     except:
         pass
@@ -1994,6 +2075,10 @@ def unlink_output(args):
         return
 
     with complete_step('Removing output files'):
+        try:
+            zfs_dataset_delete(os.path.join(args.output_pool, ZFS_DATASET))
+        except:
+            pass
         unlink_try_hard(args.output)
 
         if args.checksum:
@@ -2066,6 +2151,9 @@ def process_setting(args, section, key, value):
         elif key == "Output":
             if args.output is None:
                 args.output = value
+        elif key == "OutputPool":
+            if args.output_pool is None:
+                args.output_pool = value
         elif key == "Force":
             if not args.force:
                 args.force = parse_boolean(value)
@@ -2373,6 +2461,12 @@ def load_args():
     else:
         args.output_format = OutputFormat[args.output_format]
 
+    if args.output_format == OutputFormat.dataset and not args.output_pool:
+        die("Output pool must be specified for dataset format.")
+
+    if args.output_format == OutputFormat.dataset and args.incremental:
+        die("Incremental build is not implemented for dataset format.")
+
     if args.distribution is not None:
         args.distribution = Distribution[args.distribution]
 
@@ -2422,8 +2516,8 @@ def load_args():
         if args.distribution == Distribution.ubuntu:
             die("Bootable images are currently not supported on Ubuntu.")
 
-        if args.output_format in (OutputFormat.directory, OutputFormat.subvolume, OutputFormat.tar):
-            die("Directory, subvolume and tar images cannot be booted.")
+        if args.output_format in (OutputFormat.directory, OutputFormat.subvolume, OutputFormat.tar, OutputFormat.dataset):
+            die("Directory, subvolume, dataset and tar images cannot be booted.")
 
     if args.encrypt is not None:
         if args.output_format not in (OutputFormat.raw_gpt, OutputFormat.raw_btrfs, OutputFormat.raw_squashfs):
@@ -2583,12 +2677,13 @@ def print_summary(args):
         sys.stderr.write("              Hostname: " + args.hostname + "\n")
     sys.stderr.write("         Output Format: " + args.output_format.name + "\n")
     sys.stderr.write("                Output: " + args.output + "\n")
+    sys.stderr.write("            OutputPool: " + args.output_pool + "\n")
     sys.stderr.write("       Output Checksum: " + none_to_na(args.output_checksum if args.checksum else None) + "\n")
     sys.stderr.write("      Output Signature: " + none_to_na(args.output_signature if args.sign else None) + "\n")
     sys.stderr.write("Output nspawn Settings: " + none_to_na(args.output_nspawn_settings if args.nspawn_settings is not None else None) + "\n")
     sys.stderr.write("           Incremental: " + yes_no(args.incremental) + "\n")
 
-    if args.output_format in (OutputFormat.raw_gpt, OutputFormat.raw_btrfs, OutputFormat.raw_squashfs, OutputFormat.subvolume):
+    if args.output_format in (OutputFormat.raw_gpt, OutputFormat.raw_btrfs, OutputFormat.raw_squashfs, OutputFormat.subvolume, OutputFormat.dataset):
         sys.stderr.write("             Read-only: " + yes_no(args.read_only) + "\n")
     if args.output_format in (OutputFormat.raw_btrfs, OutputFormat.subvolume):
         sys.stderr.write("        FS Compression: " + yes_no(args.compress) + "\n")
@@ -2808,6 +2903,10 @@ def remove_artifacts(args, workspace, raw, tar, run_build_script, for_cache=Fals
             del tar
 
     with complete_step("Removing artifacts from " + what):
+        try:
+            zfs_dataset_delete(os.path.join(args.output_pool, ZFS_DATASET))
+        except:
+            pass
         unlink_try_hard(os.path.join(workspace, "root"))
         unlink_try_hard(os.path.join(workspace, "var-tmp"))
 
@@ -2899,6 +2998,11 @@ def main():
         init_namespace(args)
         build_stuff(args)
         print_output_size(args)
+
+    if args.output_format == OutputFormat.dataset:
+        reattach_namespace()
+        mount_zfs_datasets(args)
+
 
 if __name__ == "__main__":
     main()
