@@ -2055,12 +2055,6 @@ def unlink_try_hard(path):
         pass
 
     try:
-        ret = subprocess.run(["zfs", "get", "-H", "-o", "name", "mountpoint", path], stdout=subprocess.PIPE, check=True)
-        zfs_dataset_delete(ret.stdout.strip())
-    except:
-        pass
-
-    try:
         shutil.rmtree(path)
     except:
         pass
@@ -2677,7 +2671,8 @@ def print_summary(args):
         sys.stderr.write("              Hostname: " + args.hostname + "\n")
     sys.stderr.write("         Output Format: " + args.output_format.name + "\n")
     sys.stderr.write("                Output: " + args.output + "\n")
-    sys.stderr.write("            OutputPool: " + args.output_pool + "\n")
+    if args.output_pool:
+        sys.stderr.write("            OutputPool: " + args.output_pool + "\n")
     sys.stderr.write("       Output Checksum: " + none_to_na(args.output_checksum if args.checksum else None) + "\n")
     sys.stderr.write("      Output Signature: " + none_to_na(args.output_signature if args.sign else None) + "\n")
     sys.stderr.write("Output nspawn Settings: " + none_to_na(args.output_nspawn_settings if args.nspawn_settings is not None else None) + "\n")
