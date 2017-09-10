@@ -1185,9 +1185,6 @@ def install_opensuse(args, workspace, run_build_script):
     if args.output_format in (OutputFormat.subvolume, OutputFormat.raw_btrfs):
         extra_packages += ["btrfsprogs"]
 
-    if args.output_format == OutputFormat.dataset:
-        extra_packages += ["zfsutils-linux"]
-
     if args.packages:
         extra_packages += args.packages
 
